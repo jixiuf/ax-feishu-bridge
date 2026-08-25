@@ -13,6 +13,7 @@ import {
 import { CardKitStream } from "./cardkit-stream.ts";
 import { loadConfig, runtimeEnv } from "./config.ts";
 import { debugLog } from "./debug.ts";
+import { appendReplyFooter } from "./rich-text.ts";
 
 export type { ReplyCardStatus } from "./card-builder.ts";
 export {
@@ -195,8 +196,8 @@ export class ReplyCard implements ReplyCardSink {
     await this.finishFinal(status, note);
   }
 
-  async completeWithAnswer(answer: string) {
-    this.ensureFinal(answer || "（无内容）");
+  async completeWithAnswer(answer: string, footer?: string) {
+    this.ensureFinal(appendReplyFooter(answer || "（无内容）", footer));
     await this.finishFinal("done", undefined);
   }
 

@@ -78,6 +78,9 @@ export function buildMarkdownCardParts(text: string, language: "zh" | "en" = "zh
 function createMarkdownCard(title: string, content: string, copySourceId?: string) {
   return {
     schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+    },
     header: {
       title: {
         tag: "plain_text",
@@ -384,4 +387,69 @@ function splitText(text: string, max: number) {
 
 function fallbackLocale(locale: LocaleKey): LocaleKey {
   return locale === "zh_cn" ? "en_us" : "zh_cn";
+}
+
+/**
+ * 在回复正文末尾追加 footer（footer 单独成段）。
+ * footer 为空/纯空白时保持原样，避免产生只有 footer 的消息。
+ */
+export function appendReplyFooter(text: string, footer?: string): string {
+  const trimmed = text.trim();
+  if (!trimmed || !footer?.trim()) return text;
+  return `${trimmed}\n\n${footer.trim()}`;
+}
+
+/** 与 /status 一致的 token 数量格式化（1.2M / 4.2k / 512） */
+export function formatTokenCount(n: number) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}k`;
+  return `${n}`;
+}
+
+export type ReplyFooterContext = {
+  tokens: number | null;
+  contextWindow: number | null;
+  percent: number | null;
+  totalInput?: number;
+  totalOutput?: number;
+  totalCacheRead?: number;
+  totalCost?: number;
+  totalMessages?: number;
+} | null;
+
+/**
+ * 生成回复末尾的状态 footer（内容对应 /status 的模型/上下文/Token 行）。
+ * 数据不足时自动降级，始终返回非空字符串。
+ */
+export function formatReplyFooter(model: string, ctx: ReplyFooterContext): string {
+  const lines: string[] = [];
+
+  if (ctx) {
+    if (ctx.tokens !== null && ctx.contextWindow !== null && ctx.percent !== null) {
+      lines.push(`${ctx.percent.toFixed(1)}% / ${formatTokenCount(ctx.contextWindow)} (↑${formatTokenCount(ctx.tokens)} tokens)`);
+    } else {
+      lines.push("暂无数据");
+    }
+    if (ctx.totalInput !== undefined) {
+      const parts = [
+        `in ${formatTokenCount(ctx.totalInput)}`,
+        `out ${formatTokenCount(ctx.totalOutput ?? 0)}`,
+        `cache ${formatTokenCount(ctx.totalCacheRead ?? 0)}`,
+      ];
+      if (ctx.totalCost !== undefined && ctx.totalCost > 0) {
+        parts.push(`$${ctx.totalCost.toFixed(4)}`);
+      }
+      lines.push(parts.join(" · "));
+    }
+  } else {
+    lines.push("暂无数据");
+  }
+
+  return `${shortModelName(model)} · ${lines.join(" · ")}`;
+}
+
+/** 去掉 provider 前缀，只显示模型名（deepseek/deepseek-v4-flash → deepseek-v4-flash） */
+function shortModelName(model: string): string {
+  const parts = model.split("/");
+  return parts.length > 1 ? parts[parts.length - 1] : model;
 }

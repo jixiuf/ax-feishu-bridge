@@ -11,6 +11,7 @@ import {
   setRuntimeConfig,
 } from "./runtime-config.ts";
 import { conversationKey, conversationLabel, buildPromptWithQuote, getCommandList, normalizeForDedupe, parseBotCommand, parseMessageInput, pruneRecentMap } from "./messages.ts";
+import { formatReplyFooter, formatTokenCount } from "./rich-text.ts";
 import { ReplyCard } from "./reply-card.ts";
 import type { FeishuBridgeStore } from "./bridge-store.ts";
 import type { FeishuTransport } from "./transport.ts";
@@ -150,7 +151,8 @@ export class FeishuMessageHandler {
         prompt,
         imageInputs,
         async (reply) => {
-          await card.completeWithAnswer(reply || "（无内容）");
+          const footer = await this.buildReplyFooter(key);
+          await card.completeWithAnswer(reply || "（无内容）", footer);
         },
         card,
         useStreaming ? (delta) => card.append(delta) : undefined,
@@ -223,19 +225,14 @@ export class FeishuMessageHandler {
       const ctx = await this.conversations.getContextStatus(key);
       const model = await this.conversations.getActualModel(key);
       const thinking = await this.conversations.getThinkingStatus(key);
-      const formatTokens = (n: number) => {
-        if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-        if (n >= 1_000) return `${(n / 1_000).toFixed(0)}k`;
-        return `${n}`;
-      };
       const ctxLine = ctx && ctx.tokens !== null && ctx.contextWindow
-        ? `${(ctx.percent ?? 0).toFixed(1)}% / ${formatTokens(ctx.contextWindow)} (↑${formatTokens(ctx.tokens ?? 0)} tokens)`
+        ? `${(ctx.percent ?? 0).toFixed(1)}% / ${formatTokenCount(ctx.contextWindow)} (↑${formatTokenCount(ctx.tokens ?? 0)} tokens)`
         : "暂无数据（发送一条消息后才会显示）";
       // Token 明细（仅 Pi adapter 提供；Harness 阶段未接入 token-meter）
       const tokenLines: string[] = [];
       if (ctx && ctx.totalInput !== undefined) {
         tokenLines.push(
-          `Token: in ${formatTokens(ctx.totalInput)} · out ${formatTokens(ctx.totalOutput ?? 0)} · cache ${formatTokens(ctx.totalCacheRead ?? 0)}`,
+          `Token: in ${formatTokenCount(ctx.totalInput)} · out ${formatTokenCount(ctx.totalOutput ?? 0)} · cache ${formatTokenCount(ctx.totalCacheRead ?? 0)}`,
         );
         const detail: string[] = [];
         if (ctx.totalMessages !== undefined) detail.push(`消息 ${ctx.totalMessages}`);
@@ -327,6 +324,19 @@ export class FeishuMessageHandler {
     }
 
     return false;
+  }
+
+  /** 生成回复末尾的状态 footer：模型 + 上下文 + Token 明细（对应 /status） */
+  private async buildReplyFooter(key: string): Promise<string> {
+    try {
+      const [model, ctx] = await Promise.all([
+        this.conversations.getActualModel(key),
+        this.conversations.getContextStatus(key),
+      ]);
+      return formatReplyFooter(model, ctx);
+    } catch {
+      return "";
+    }
   }
 
   private isDuplicateContent(msg: FeishuMessage, key: string, text: string, attachments: Array<{ kind: string; fileKey: string; fileName?: string }>) {
