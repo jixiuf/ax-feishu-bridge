@@ -207,10 +207,6 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
     ctx.ui.notify(withBuildTag(`飞书连接已启动。\nGateway pid=${result.pid}\nLog: ${DAEMON_LOG_PATH}`), "info");
   }
 
-  function quoteShell(value: string) {
-    return `'${value.replace(/'/g, `'\\''`)}'`;
-  }
-
   function daemonSpec() {
     const piBin = process.env.PI_BIN || "pi";
     const args = [
@@ -226,10 +222,6 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
     return { extensionPath: extensionEntry, piBin, args };
   }
 
-  function daemonCommand() {
-    const { piBin, args } = daemonSpec();
-    return `tail -f /dev/null | exec ${quoteShell(piBin)} ${args.map(quoteShell).join(" ")}`;
-  }
 
   async function startDaemon(takeover = false) {
     return withDaemonSpawnLock(async () => {
@@ -274,16 +266,21 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
           env: { ...process.env, PI_FEISHU_DAEMON: "1" },
           stdio: ["pipe", logFd, logFd],
         });
-        // 保持 stdin 打开，等价于 Linux 侧 `tail -f /dev/null |` 的作用，
-        // 否则 pi --mode rpc 会在 stdin EOF 后退出。
+        // 保持 stdin 打开，防止 pi --mode rpc 在 stdin EOF 后退出（与 Unix 分支一致）。
         if (child.stdin) (child.stdin as unknown as Readable).resume();
       } else {
-        child = spawn("bash", ["-lc", daemonCommand()], {
+        // 直接 spawn pi（不经 bash/tail 包装）：旧实现 `tail -f /dev/null | exec pi ...`
+        // 在 pi 退出（如锁被占 exit(0)）后，tail -f /dev/null 永不产生输出、永不 SIGPIPE，
+        // 会留下 bash+tail 永久空壳（孤儿进程累积）。改为保持 stdin 打开（resume）即可
+        // 防止 pi --mode rpc 因 stdin EOF 退出，与 Windows 分支方案一致。
+        const { piBin, args } = daemonSpec();
+        child = spawn(piBin, args, {
           detached: true,
           cwd: process.cwd(),
           env: { ...process.env, PI_FEISHU_DAEMON: "1" },
-          stdio: ["ignore", logFd, logFd],
+          stdio: ["pipe", logFd, logFd],
         });
+        if (child.stdin) (child.stdin as unknown as Readable).resume();
       }
       child.unref();
 
