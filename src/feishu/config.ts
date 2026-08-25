@@ -306,6 +306,7 @@ export function loadBaseConfig(): FeishuConfig | undefined {
       streamFirstFlushMs: parsePositiveInt(env("STREAM_FIRST_FLUSH_MS"), DEFAULT_CONFIG.streamFirstFlushMs!),
       streamMinChars: parsePositiveInt(env("STREAM_MIN_CHARS"), DEFAULT_CONFIG.streamMinChars!),
       streamMaxBodyChars: parsePositiveInt(env("STREAM_MAX_BODY_CHARS"), DEFAULT_CONFIG.streamMaxBodyChars!),
+      daemonExtraExtensions: parseExtraExtensions(env("DAEMON_EXTENSIONS")),
     });
   }
   if (!existsSync(source.configPath)) return undefined;
@@ -340,7 +341,17 @@ export function loadBaseConfig(): FeishuConfig | undefined {
     streamFirstFlushMs: cfg.streamFirstFlushMs,
     streamMinChars: cfg.streamMinChars,
     streamMaxBodyChars: cfg.streamMaxBodyChars,
+    daemonExtraExtensions: parseExtraExtensions(cfg.daemonExtraExtensions),
   });
+}
+
+/** 逗号分隔字符串 → 去空白数组；数组直接透传。 */
+function parseExtraExtensions(value: string | string[] | undefined): string[] | undefined {
+  if (Array.isArray(value)) return value.map((s) => s.trim()).filter(Boolean);
+  if (typeof value === "string" && value.trim()) {
+    return value.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  return undefined;
 }
 
 function parseCardActionMode(value: unknown): CardActionMode | undefined {

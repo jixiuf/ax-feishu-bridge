@@ -54,6 +54,13 @@ export type FeishuConfig = {
   streamMinChars?: number;
   streamFirstFlushMs?: number;
   streamMaxBodyChars?: number;
+  /**
+   * daemon（--mode rpc 飞书网关进程）额外加载的扩展入口（绝对路径），
+   * 如 pi-hub：["/Users/xxx/.pi/agent/extensions/pi-hub/index.ts"]。
+   * 使 daemon 内飞书会话的 agent 也能使用这些扩展的能力（工具/命令）。
+   * 也可用环境变量 FEISHU_DAEMON_EXTENSIONS（逗号分隔）配置。
+   */
+  daemonExtraExtensions?: string[];
 };
 
 export type ModelSelection = {

@@ -37,6 +37,11 @@ export class FeishuBridgeStore {
     return this.read().routes[sessionKey];
   }
 
+  /** 全部已绑定会话路由（供外部桥 activeKey/keys 使用）。 */
+  listRoutes(): Record<string, FeishuRoute> {
+    return this.read().routes;
+  }
+
   bindJob(sessionKey: string, jobId: string, jobName?: string, sessionId?: string): FeishuJobRoute | undefined {
     const state = this.read();
     const route = state.routes[sessionKey];

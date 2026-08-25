@@ -485,6 +485,28 @@ export class PiConversationRuntime implements ConversationRuntime {
     return this.modelRuntimePromise;
   }
 
+  /**
+   * 外部注入（pi-hub 等）：把外部消息（协调消息 / subagent 回传 / 本地消息）送进
+   * 指定飞书会话，复用与普通飞书消息相同的串行队列（不打断正在进行的轮次）。
+   * 不创建 ReplyCard；回复文本通过 onReply 收集返回，由调用方决定是否回显到飞书。
+   */
+  async injectExternal(
+    key: string,
+    userText: string,
+  ): Promise<{ ok: boolean; reply?: string; error?: string }> {
+    let replyText = "";
+    try {
+      await this.promptWithImages(key, userText, [], async (reply) => {
+        replyText = reply || "";
+      }, undefined, undefined);
+      return { ok: true, reply: replyText };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      debugLog("feishu.external.inject_failed", { key, error: message });
+      return { ok: false, error: message };
+    }
+  }
+
   resetMemory() {
     for (const session of this.sessions.values()) {
       void session.then((s) => s.dispose()).catch(() => undefined);

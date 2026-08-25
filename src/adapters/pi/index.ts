@@ -22,6 +22,12 @@ import {
 import { BotUnavailableError, FeishuTransport } from "../../feishu/transport.ts";
 import type { FeishuConfig, FeishuStatus } from "../../feishu/types.ts";
 import { createCardActionHandler } from "../../feishu/card-actions.ts";
+import {
+  EXTERNAL_BRIDGE_KEY,
+  registerExternalBridge,
+  unregisterExternalBridge,
+  type ExternalFeishuBridge,
+} from "../../feishu/external-bridge.ts";
 import { PiConversationRuntime, handlePiMessageEnd } from "./PiConversationRuntime.ts";
 
 /**
@@ -176,6 +182,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
       gatewayLock.startHeartbeat();
       await gatewayLock.update("connected");
       updateStatus("connected");
+      registerExternalBridge(buildExternalBridge());
       return "started";
     } catch (error) {
       updateStatus(error instanceof BotUnavailableError ? "bot unavailable" : "disconnected");
@@ -191,7 +198,94 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
     transport = undefined;
     await gatewayLock?.release();
     gatewayLock = undefined;
+    unregisterExternalBridge();
     updateStatus(loadConfig() ? "disconnected" : "not configured");
+  }
+
+  /**
+   * 外部协作桥（供 pi-hub 等通过 globalThis.__AX_FEISHU_BRIDGE__ 调用）：
+   *  - inject：向飞书会话注入外部消息（协调消息 / subagent 回传 / 本地消息），回复回显到飞书
+   *  - acquire：本机抢占/启动飞书 gateway（pi-hub 发起 feishu 接管时用）
+   *  - release：本机释放飞书 gateway（收到 feishu 接管请求时让位）
+   * gateway 启动成功后注册（start()），停止时注销（stop()）。
+   */
+  function buildExternalBridge(): ExternalFeishuBridge {
+    const activeKey = (): string | undefined => {
+      const routes = bridgeStore.listRoutes();
+      let best: { key: string; updatedAt: number } | undefined;
+      for (const key of Object.keys(routes)) {
+        const updatedAt = routes[key].updatedAt || 0;
+        if (!best || updatedAt > best.updatedAt) best = { key, updatedAt };
+      }
+      return best?.key;
+    };
+    return {
+      version: "1.0.0",
+      isActive: () => transport?.isRunning() === true,
+      owner: () => currentGatewayOwner(),
+      activeKey,
+      keys: () => Object.keys(bridgeStore.listRoutes()),
+      inject: async (keyOrActive, text, opts) => {
+        const echo = opts?.echo !== false;
+        const key = !keyOrActive || keyOrActive === "active" ? activeKey() : keyOrActive;
+        if (!key) {
+          return { ok: false, error: "无飞书会话可注入（还没有会话绑定）", key: undefined };
+        }
+        const route = bridgeStore.getRoute(key);
+        if (!route) {
+          return { ok: false, error: `飞书会话不存在: ${key}`, key };
+        }
+        const result = await conversations.injectExternal(key, text);
+        if (!result.ok) {
+          return { ok: false, error: result.error || "飞书会话注入失败", key };
+        }
+        if (echo && result.reply) {
+          try {
+            await delivery.send(route, result.reply);
+          } catch (error) {
+            debugLog("feishu.external.echo_failed", {
+              key,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return {
+              ok: true,
+              reply: result.reply,
+              error: `回复已生成但回显失败: ${error instanceof Error ? error.message : String(error)}`,
+              key,
+            };
+          }
+        }
+        return { ok: true, reply: result.reply, key };
+      },
+      acquire: async () => {
+        if (transport?.isRunning()) {
+          return { ok: true, message: "已持有飞书连接" };
+        }
+        const result = await startDaemon(true);
+        if (result.status === "started") {
+          return { ok: true, message: `已启动飞书连接 pid=${result.pid}` };
+        }
+        if (result.status === "busy") {
+          return { ok: false, message: `飞书连接被占用: ${formatOwner(result.owner)}` };
+        }
+        return { ok: false, message: "飞书连接启动失败" };
+      },
+      release: async () => {
+        const owner = currentGatewayOwner();
+        if (!owner) {
+          return { ok: true, message: "飞书连接未在运行，无需释放" };
+        }
+        if (owner.pid === process.pid) {
+          await stop();
+          return { ok: true, message: "已释放本机飞书连接" };
+        }
+        const result = await stopDaemon();
+        if (result.status === "error") {
+          return { ok: false, message: `释放失败: ${result.error instanceof Error ? result.error.message : String(result.error)}` };
+        }
+        return { ok: true, message: `已释放飞书连接（${result.status}）` };
+      },
+    };
   }
 
   function formatOwner(owner: GatewayOwner | undefined) {
@@ -219,6 +313,12 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
       "--no-builtin-tools",
       "-e", extensionEntry,
     ];
+    // 追加外部扩展（如 pi-hub），使 daemon 内飞书会话的 agent 也具备协调能力。
+    // 配置：config.pi.json 的 daemonExtraExtensions 或环境变量 FEISHU_DAEMON_EXTENSIONS（逗号分隔）。
+    const extras = loadConfig()?.daemonExtraExtensions || [];
+    for (const extra of extras) {
+      args.push("-e", extra);
+    }
     return { extensionPath: extensionEntry, piBin, args };
   }
 
