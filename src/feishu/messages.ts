@@ -10,7 +10,10 @@ export type BotCommand =
   | { name: "workspace"; path?: string }
   | { name: "status" }
   | { name: "commands" }
-  | { name: "config"; key?: string; value?: string; clearTarget?: string };
+  | { name: "config"; key?: string; value?: string; clearTarget?: string }
+  | { name: "feishu"; action?: "start" | "stop" | "restart" | "status" }
+  | { name: "reload" }
+  | { name: "reloadall" };
 
 type PostBody = {
   title?: string;
@@ -130,6 +133,14 @@ export function parseBotCommand(text: string): BotCommand | undefined {
     const value = rest.slice(key.length).trim();
     return { name: "config", key, value: value || undefined };
   }
+  // /feishu restart|stop|start|status — 飞书内管理网关（daemon）
+  const feishuMatch = trimmed.match(/^\/feishu(?:\s+(start|stop|restart|status))?$/i);
+  if (feishuMatch) {
+    return { name: "feishu", action: (feishuMatch[1]?.toLowerCase() || "status") as "start" | "stop" | "restart" | "status" };
+  }
+  // /reload /reloadall — 重载本实例扩展 / 广播重载所有实例（经 pi-hub 机制执行）
+  if (trimmed === "/reload") return { name: "reload" };
+  if (trimmed === "/reloadall") return { name: "reloadall" };
   return undefined;
 }
 
@@ -145,6 +156,9 @@ export function getCommandList(): string {
     "/config — 查看/修改运行时配置（群触发、流式等）",
     "/config <key> <value> — 设置白名单配置并立即生效",
     "/config clear [key|all] — 清除 runtime overrides",
+    "/feishu [start|stop|restart|status] — 管理飞书网关（默认 status）",
+    "/reload — 重载当前实例扩展",
+    "/reloadall — 广播重载所有实例",
     "/commands — 显示命令列表",
   ].join("\n");
 }

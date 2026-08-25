@@ -19,21 +19,37 @@ import type { FeishuMessage } from "./types.ts";
 
 const CONTENT_DEDUPE_TTL_MS = 5_000;
 
+/**
+ * 飞书网关（daemon）管理能力，由适配器（src/adapters/pi/index.ts）注入。
+ * 供飞书内 /feishu restart|stop|start|status 命令调用。
+ */
+export type FeishuGatewayOps = {
+  restart(): Promise<{ ok: boolean; message?: string }>;
+  stop(): Promise<{ ok: boolean; message?: string }>;
+  start(): Promise<{ ok: boolean; message?: string }>;
+  status(): Promise<{ ok: boolean; message?: string }>;
+  reload(): Promise<{ ok: boolean; message?: string }>;
+  reloadall(): Promise<{ ok: boolean; message?: string }>;
+};
+
 export class FeishuMessageHandler {
   private readonly seen = new Set<string>();
   private readonly recentContent = new Map<string, number>();
   private readonly conversations: ConversationRuntime;
   private readonly getTransport: () => FeishuTransport | undefined;
   private readonly bridgeStore?: FeishuBridgeStore;
+  private readonly feishuOps?: FeishuGatewayOps;
 
   constructor(
     conversations: ConversationRuntime,
     getTransport: () => FeishuTransport | undefined,
     bridgeStore?: FeishuBridgeStore,
+    feishuOps?: FeishuGatewayOps,
   ) {
     this.conversations = conversations;
     this.getTransport = getTransport;
     this.bridgeStore = bridgeStore;
+    this.feishuOps = feishuOps;
   }
 
   reset() {
@@ -319,6 +335,37 @@ export class FeishuMessageHandler {
       await transport.replyText(
         msg.messageId,
         cfg ? formatRuntimeConfig(cfg, getRuntimeOverrides()) : "配置不可用（缺少 FEISHU_APP_ID/SECRET）",
+      );
+      return true;
+    }
+
+    // /feishu restart|stop|start|status — 飞书内管理网关（daemon）
+    if (command.name === "feishu") {
+      if (!this.feishuOps) {
+        await transport.replyText(msg.messageId, "当前运行环境未提供 /feishu 网关管理能力。");
+        return true;
+      }
+      const action = command.action || "status";
+      const result = await this.feishuOps[action]();
+      await transport.replyText(
+        msg.messageId,
+        result.ok ? `✅ ${result.message || action + " ok"}` : `❌ ${result.message || action + " failed"}`,
+      );
+      return true;
+    }
+
+    // /reload /reloadall — 重载扩展 / 广播重载（经 pi-hub 机制执行）
+    if (command.name === "reload" || command.name === "reloadall") {
+      if (!this.feishuOps?.reload || !this.feishuOps?.reloadall) {
+        await transport.replyText(msg.messageId, "当前运行环境不支持 /reload /reloadall。");
+        return true;
+      }
+      const result = command.name === "reload"
+        ? await this.feishuOps.reload()
+        : await this.feishuOps.reloadall();
+      await transport.replyText(
+        msg.messageId,
+        result.ok ? `✅ ${result.message || command.name + " ok"}` : `❌ ${result.message || command.name + " failed"}`,
       );
       return true;
     }

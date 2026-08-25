@@ -10,7 +10,7 @@ import { FeishuBridgeRuntime } from "../../feishu/bridge-runtime.ts";
 import { FeishuBridgeStore } from "../../feishu/bridge-store.ts";
 import { FeishuDelivery } from "../../feishu/delivery.ts";
 import { acquireGatewayLock, gatewayLockPath, readGatewayOwner, type GatewayLockHandle, type GatewayOwner } from "../../feishu/gateway-lock.ts";
-import { FeishuMessageHandler } from "../../feishu/message-handler.ts";
+import { FeishuMessageHandler, type FeishuGatewayOps } from "../../feishu/message-handler.ts";
 import { runSetup, uiConfirm } from "./setup.ts";
 import {
   RUNTIME_CONFIG_KEYS,
@@ -62,7 +62,12 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
     promptNotifySec: initialConfig?.promptNotifySec,
     promptTimeoutSec: initialConfig?.promptTimeoutSec,
   });
-  const messageHandler = new FeishuMessageHandler(conversations, () => transport, bridgeStore);
+  const messageHandler = new FeishuMessageHandler(
+    conversations,
+    () => transport,
+    bridgeStore,
+    buildFeishuOps(),
+  );
 
   const STATUS_KEY = "feishu-connection";
   const STATUS_REFRESH_MS = 2_000;
@@ -172,7 +177,8 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
       gatewayLock = undefined;
       updateStatus(loadConfig() ? "owned" : "not configured");
       if (process.env.PI_FEISHU_DAEMON === "1") {
-        terminateLauncherParent();
+        terminateLauncherParent(extensionEntry);
+        killOwnStdinTail();
         process.exit(0);
       }
     });
@@ -186,6 +192,10 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
       return "started";
     } catch (error) {
       updateStatus(error instanceof BotUnavailableError ? "bot unavailable" : "disconnected");
+      debugLog("feishu.gateway.start_error", {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
       await gatewayLock.release();
       gatewayLock = undefined;
       transport = undefined;
@@ -200,6 +210,100 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
     gatewayLock = undefined;
     unregisterExternalBridge();
     updateStatus(loadConfig() ? "disconnected" : "not configured");
+  }
+
+  /**
+   * 飞书内 /feishu restart|stop|start|status 的网关管理实现（由 message-handler 调用）。
+   * 复用既有 startDaemon / stopDaemon / restartDaemon（含 gateway lock 抢占语义）。
+   */
+  function buildFeishuOps(): FeishuGatewayOps {
+    return {
+      restart: async () => {
+        const result = await restartDaemon();
+        if (result.status === "error") {
+          return {
+            ok: false,
+            message: `重启失败: ${result.stopped.error instanceof Error ? result.stopped.error.message : String(result.stopped.error)}`,
+          };
+        }
+        const pid = (result.started as { status?: string; pid?: number }).status === "started"
+          ? (result.started as { pid?: number }).pid
+          : undefined;
+        // 修复：daemon 内 restart 后，本进程（旧 daemon）安排延迟退出。
+        // 旧进程 transport 已停但进程不退出会累积成僵尸链，残留连接还会静默吞掉飞书消息。
+        if (process.env.PI_FEISHU_DAEMON === "1") {
+          scheduleDaemonExit(`restart complete, successor pid=${pid ?? "?"}`, 5000);
+        }
+        return { ok: true, message: `飞书连接已重启${pid ? `（pid=${pid}）` : ""}` };
+      },
+      stop: async () => {
+        const result = await stopDaemon();
+        if (result.status === "error") {
+          return {
+            ok: false,
+            message: `停止失败: ${result.error instanceof Error ? result.error.message : String(result.error)}`,
+          };
+        }
+        if (process.env.PI_FEISHU_DAEMON === "1") {
+          scheduleDaemonExit("stop requested", 3000);
+        }
+        return { ok: true, message: `飞书连接已停止（${result.status}）` };
+      },
+      start: async () => {
+        const result = await startDaemon(false);
+        if (result.status === "started") {
+          return { ok: true, message: `飞书连接已启动（pid=${result.pid}）` };
+        }
+        return { ok: false, message: `飞书连接已被占用: pid=${result.owner?.pid}, status=${result.owner?.status}` };
+      },
+      reload: async () => {
+        // daemon 内 /reload = 重启 daemon（新进程加载最新扩展代码，避免原地 ctx.reload()
+        // 导致的 feishu 桥实例泄漏/锁冲突自杀）；非 daemon（主实例）经 pi-hub 注入真正 reload。
+        if (process.env.PI_FEISHU_DAEMON === "1") {
+          const result = await restartDaemon();
+          if (result.status === "error") {
+            return {
+              ok: false,
+              message: `reload 失败: ${result.stopped.error instanceof Error ? result.stopped.error.message : String(result.stopped.error)}`,
+            };
+          }
+          const pid = (result.started as { status?: string; pid?: number }).status === "started"
+            ? (result.started as { pid?: number }).pid
+            : undefined;
+          scheduleDaemonExit(`reload (restart) complete, successor pid=${pid ?? "?"}`, 5000);
+          return { ok: true, message: `已重启飞书连接并加载最新代码${pid ? `（pid=${pid}）` : ""}` };
+        }
+        try {
+          await pi.sendUserMessage("/__hub_reload", {
+            expandPromptTemplates: true,
+          } as Parameters<typeof pi.sendUserMessage>[1] & { expandPromptTemplates: boolean });
+          return { ok: true, message: "reload 已触发（本实例扩展重载中）" };
+        } catch (error) {
+          return { ok: false, message: `reload 失败: ${error instanceof Error ? error.message : String(error)}` };
+        }
+      },
+      reloadall: async () => {
+        try {
+          // 经 pi-hub 的 /reloadall 广播到所有实例（含当前实例，由 pi-hub 处理）
+          await pi.sendUserMessage("/reloadall", {
+            expandPromptTemplates: true,
+          } as Parameters<typeof pi.sendUserMessage>[1] & { expandPromptTemplates: boolean });
+          return { ok: true, message: "reloadall 已广播到所有实例（pi-hub 执行中）" };
+        } catch (error) {
+          return { ok: false, message: `reloadall 失败: ${error instanceof Error ? error.message : String(error)}` };
+        }
+      },
+      status: async () => {
+        const owner = currentGatewayOwner();
+        if (!owner) {
+          return { ok: true, message: "飞书连接未在运行" };
+        }
+        return {
+          ok: true,
+          message: `飞书连接运行中: pid=${owner.pid}, status=${owner.status}, startedAt=${owner.startedAt}, cwd=${owner.cwd}`,
+        };
+      },
+    };
   }
 
   /**
@@ -369,16 +473,33 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
         // 保持 stdin 打开，防止 pi --mode rpc 在 stdin EOF 后退出（与 Unix 分支一致）。
         if (child.stdin) (child.stdin as unknown as Readable).resume();
       } else {
-        // 直接 spawn pi（不经 bash/tail 包装）：旧实现 `tail -f /dev/null | exec pi ...`
-        // 在 pi 退出（如锁被占 exit(0)）后，tail -f /dev/null 永不产生输出、永不 SIGPIPE，
-        // 会留下 bash+tail 永久空壳（孤儿进程累积）。改为保持 stdin 打开（resume）即可
-        // 防止 pi --mode rpc 因 stdin EOF 退出，与 Windows 分支方案一致。
+        // 修复：daemon 的 stdin 保活通道必须与父进程生命周期解耦。
+        // 直接用 pipe+resume 时，父 daemon 按计划退出（restart/stop 的 scheduleDaemonExit）
+        // 或被 reap 杀掉 → 子 daemon 的 stdin EOF → pi --mode rpc 随之退出，
+        // 新 daemon 启动即死，飞书桥链条式全灭（两次 restart 全挂的根因）。
+        // 改为 spawn 一个 detached 的 tail -f /dev/null 作为 stdin 保活源；
+        // tail 的 pid 通过 FEISHU_STDIN_TAIL_PID 传给子 daemon，由子 daemon 退出时自清理
+        // （不能用 reap 自动清理孤儿 tail：父 daemon 退出后 tail 变 ppid=1，但可能仍被子 daemon 用作 stdin）。
         const { piBin, args } = daemonSpec();
+        let stdinHolder: ChildProcess | undefined;
+        try {
+          stdinHolder = spawn("tail", ["-f", "/dev/null"], {
+            detached: true,
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+          stdinHolder.unref();
+        } catch {}
         child = spawn(piBin, args, {
           detached: true,
           cwd: process.cwd(),
-          env: { ...process.env, PI_FEISHU_DAEMON: "1" },
-          stdio: ["pipe", logFd, logFd],
+          env: {
+            ...process.env,
+            PI_FEISHU_DAEMON: "1",
+            FEISHU_STDIN_TAIL_PID: stdinHolder ? String(stdinHolder.pid) : "",
+          },
+          stdio: stdinHolder
+            ? [stdinHolder.stdout as Readable, logFd, logFd]
+            : ["pipe", logFd, logFd],
         });
         if (child.stdin) (child.stdin as unknown as Readable).resume();
       }
@@ -573,16 +694,28 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
 
   if (bootConfig?.autoStart) {
     if (process.env.PI_FEISHU_DAEMON === "1") {
-      start().then((result) => {
-        if (typeof result === "object" && result.status === "owned") {
-          console.error("[feishu] daemon found existing owner, exiting:", formatOwner(result.owner));
-          process.exit(0);
+      // 修复：daemon 启动失败时输出完整错误（含 stack）并重试，
+      // 瞬时网络/API 抖动不应直接 exit(1) 导致飞书桥整体失联。
+      const tryStart = async (attempt: number): Promise<void> => {
+        try {
+          const result = await start();
+          if (typeof result === "object" && result.status === "owned") {
+            console.error("[feishu] daemon found existing owner, exiting:", formatOwner(result.owner));
+            killOwnStdinTail();
+            process.exit(0);
+          }
+        } catch (error) {
+          const detail = error instanceof Error ? `${error.message}${error.stack ? `\n${error.stack}` : ""}` : String(error);
+          console.error(`[feishu] daemon autoStart failed (attempt ${attempt + 1}/4):`, detail);
+          if (attempt < 3) {
+            await sleep(3000);
+            return tryStart(attempt + 1);
+          }
+          killOwnStdinTail();
+          process.exit(1);
         }
-      }).catch((error) => {
-        updateStatus(error instanceof BotUnavailableError ? "bot unavailable" : "disconnected");
-        console.error("[feishu] daemon autoStart failed:", error instanceof Error ? error.message : error);
-        process.exit(1);
-      });
+      };
+      void tryStart(0);
     } else {
       startDaemon(false).catch((error) => {
         updateStatus("disconnected");
@@ -667,7 +800,21 @@ function looksLikeFeishuDaemon(command: string, extensionPath?: string) {
   return command.includes("feishu/index.ts");
 }
 
-function terminateLauncherParent() {
+/** 清理孤儿 stdin 保活 tail：父进程（daemon）已退出（ppid<=1）的 tail -f /dev/null 残留。
+ * 注意：不能在 start/stop/restart 时自动调用——父 daemon 退出后 tail 变孤儿（ppid=1），
+ * 但可能仍被子 daemon 用作 stdin 保活源（FEISHU_STDIN_TAIL_PID 引用）。自动清理会误杀。
+ * 保留此函数仅供手动排查/兜底调用。 */
+function reapOrphanStdinTails() {
+  if (process.platform === "win32") return;
+  const allProcesses = listProcesses();
+  for (const proc of allProcesses) {
+    if (!proc.command.includes("tail -f /dev/null")) continue;
+    if (proc.ppid > 1) continue; // 还有活跃父进程（正在服务的 daemon）——保留
+    try { process.kill(proc.pid, "SIGTERM"); } catch {}
+  }
+}
+
+function terminateLauncherParent(extensionPath: string) {
   if (process.platform === "win32") return;
   const parentPid = process.ppid;
   if (!parentPid || parentPid <= 1) return;
@@ -679,7 +826,8 @@ function terminateLauncherParent() {
     .map((entry) => entry.trim())
     .find((entry) => entry.startsWith(`${parentPid} `));
   if (!line) return;
-  if (!line.includes("tail -f /dev/null") || !line.includes("feishu/index.ts")) return;
+  // 精确匹配：父进程必须是本扩展的旧式 tail 管道 launcher 才清理，避免误杀无关父链。
+  if (!line.includes("tail -f /dev/null") || !line.includes(extensionPath)) return;
   try { process.kill(parentPid, "SIGTERM"); } catch {}
 }
 
@@ -715,6 +863,24 @@ function tryAcquireSpawnLock(lockPath: string) {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** daemon 模式下 restart/stop 后安排本进程延迟退出：先让回执发出，再干净退出，避免僵尸 daemon 链累积。 */
+function scheduleDaemonExit(reason: string, delayMs: number) {
+  const timer = setTimeout(() => {
+    try { console.error(`[feishu] daemon exiting: ${reason}`); } catch {}
+    killOwnStdinTail();
+    process.exit(0);
+  }, delayMs);
+  timer.unref?.();
+}
+
+/** 清理本 daemon 的 stdin 保活 tail（由 FEISHU_STDIN_TAIL_PID 指定，本进程退出前调用）。 */
+function killOwnStdinTail() {
+  const pid = Number(process.env.FEISHU_STDIN_TAIL_PID || "");
+  if (Number.isFinite(pid) && pid > 1) {
+    try { process.kill(pid, "SIGTERM"); } catch {}
+  }
 }
 
 function textToolResult(text: string) {
