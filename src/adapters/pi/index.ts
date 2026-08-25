@@ -67,6 +67,7 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
     () => transport,
     bridgeStore,
     buildFeishuOps(),
+    delivery,
   );
 
   const STATUS_KEY = "feishu-connection";
@@ -388,6 +389,33 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
           return { ok: false, message: `释放失败: ${result.error instanceof Error ? result.error.message : String(result.error)}` };
         }
         return { ok: true, message: `已释放飞书连接（${result.status}）` };
+      },
+      // ── 问卷桥接（供 ask-user-question-rpc 在飞书 turn 中委托提问） ──
+      isFeishuTurnActive: () => bridge.hasActiveFeishuInput(),
+      getActiveUserId: () => {
+        const key = activeKey();
+        if (key?.startsWith("p2p:")) return key.slice(4);
+        return messageHandler.getLastSender(key);
+      },
+      askQuestion: async (opts) => {
+        const key = opts.key && opts.key !== "active" ? opts.key : activeKey();
+        const userId =
+          opts.userId ||
+          (key?.startsWith("p2p:") ? key.slice(4) : undefined) ||
+          messageHandler.getLastSender(key);
+        if (!key || !userId) return null;
+        const answer = await messageHandler.askQuestion({ ...opts, key, userId });
+        if (!answer) return null;
+        switch (answer.kind) {
+          case "option":
+            return { kind: "option" as const, answer: answer.label };
+          case "multi":
+            return { kind: "multi" as const, answer: null, selected: answer.labels };
+          case "custom":
+            return { kind: "custom" as const, answer: answer.text };
+          default:
+            return { kind: "chat" as const, answer: null };
+        }
       },
     };
   }

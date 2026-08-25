@@ -49,6 +49,29 @@ export type ExternalFeishuBridge = {
   acquire(): Promise<{ ok: boolean; message?: string }>;
   /** 释放飞书 gateway（让位给接管方）。未持有则 no-op。 */
   release(): Promise<{ ok: boolean; message?: string }>;
+  /** 当前是否有飞书触发的活跃 turn（供 ask-user-question-rpc 委托提问） */
+  isFeishuTurnActive(): boolean;
+  /** 当前活跃 turn 的目标用户 open_id（无则 null） */
+  getActiveUserId(): string | null;
+  /**
+   * 通过飞书向用户提问（选项式），挂起等待回复。
+   * 返回 null 表示超时 / 被取消 / 桥接不可用；cancel 映射为 kind="chat"。
+   */
+  askQuestion(opts: {
+    userId?: string;
+    key?: string;
+    question: string;
+    header?: string;
+    options: Array<{ label: string; description?: string }>;
+    multiSelect?: boolean;
+    index?: number;
+    total?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<
+    | { kind: "option" | "custom" | "multi" | "chat"; answer: string | null; selected?: string[] }
+    | null
+  >;
 };
 
 /** 由 Pi / Harness 适配器在 gateway 就绪后调用注册。 */

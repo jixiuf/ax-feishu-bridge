@@ -46,6 +46,11 @@ export class FeishuBridgeRuntime {
     this.activeFeishuInputs.delete(sessionId);
   }
 
+  /** 当前是否有飞书触发的活跃 turn（供外部桥 isFeishuTurnActive） */
+  hasActiveFeishuInput(): boolean {
+    return this.activeFeishuInputs.size > 0;
+  }
+
   /** Runtime 适配器把自身事件标准化后调用。 */
   handleJobEvent(event: BridgeJobEvent) {
     switch (event.kind) {

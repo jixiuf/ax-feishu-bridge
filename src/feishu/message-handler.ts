@@ -13,6 +13,14 @@ import {
 import { conversationKey, conversationLabel, buildPromptWithQuote, getCommandList, normalizeForDedupe, parseBotCommand, parseMessageInput, pruneRecentMap } from "./messages.ts";
 import { formatReplyFooter, formatTokenCount } from "./rich-text.ts";
 import { ReplyCard } from "./reply-card.ts";
+import { FeishuDelivery } from "./delivery.ts";
+import {
+  DEFAULT_QUESTION_TIMEOUT_MS,
+  formatQuestionMessage,
+  parseQuestionAnswer,
+  type ParsedQuestionAnswer,
+  type QuestionOption,
+} from "./questionnaire.ts";
 import type { FeishuBridgeStore } from "./bridge-store.ts";
 import type { FeishuTransport } from "./transport.ts";
 import type { FeishuMessage } from "./types.ts";
@@ -39,22 +47,41 @@ export class FeishuMessageHandler {
   private readonly getTransport: () => FeishuTransport | undefined;
   private readonly bridgeStore?: FeishuBridgeStore;
   private readonly feishuOps?: FeishuGatewayOps;
+  private readonly delivery?: FeishuDelivery;
+
+  /** 待答问题状态（等待飞书用户回复；目标用户的下一条文本被拦截为答案） */
+  private pendingQuestion: {
+    key: string;
+    userId: string;
+    options: QuestionOption[];
+    multiSelect: boolean;
+    resolve: (answer: ParsedQuestionAnswer | null) => void;
+  } | null = null;
+
+  /** 最近活跃会话 key 及每个会话的最后发送者 open_id（用于 group 场景定位提问对象） */
+  private lastActiveKey: string | undefined;
+  private readonly lastSenderByKey = new Map<string, string>();
 
   constructor(
     conversations: ConversationRuntime,
     getTransport: () => FeishuTransport | undefined,
     bridgeStore?: FeishuBridgeStore,
     feishuOps?: FeishuGatewayOps,
+    delivery?: FeishuDelivery,
   ) {
     this.conversations = conversations;
     this.getTransport = getTransport;
     this.bridgeStore = bridgeStore;
     this.feishuOps = feishuOps;
+    this.delivery = delivery;
   }
 
   reset() {
     this.seen.clear();
     this.recentContent.clear();
+    this.cancelPendingQuestion();
+    this.lastSenderByKey.clear();
+    this.lastActiveKey = undefined;
   }
 
   async handle(msg: FeishuMessage) {
@@ -74,6 +101,10 @@ export class FeishuMessageHandler {
       let text = parsed.text || "";
       const key = conversationKey(msg);
       this.bridgeStore?.bindConversation(key, msg);
+      // 记录最近活跃会话与最后发送者（供外部桥定位提问对象）
+      this.lastActiveKey = key;
+      this.lastSenderByKey.set(key, msg.senderOpenId);
+      if (this.lastSenderByKey.size > 200) this.lastSenderByKey.clear();
 
       // 展开引用/回复的父消息（告警卡片场景）
       let quoted: { msgType: string; text: string } | null = null;
@@ -108,6 +139,14 @@ export class FeishuMessageHandler {
         if (!text && !quoted) {
           await markFeishuMessage(msg.messageId, "ignored");
           return;
+        }
+        // 待答问题拦截：pendingQuestion 的目标用户文本作为答案消费，不进入模型/命令
+        if (text && this.pendingQuestion && this.pendingQuestion.userId === msg.senderOpenId) {
+          const consumed = this.answerPendingQuestion(msg.senderOpenId, text);
+          if (consumed) {
+            await markFeishuMessage(msg.messageId, "replied");
+            return;
+          }
         }
         if (text) {
           const handled = await this.handleCommand(msg, key, text);
@@ -179,6 +218,117 @@ export class FeishuMessageHandler {
       debugLog("feishu.handler.error", { messageId: msg.messageId, error: message });
       await markFeishuMessage(msg.messageId, "failed", message);
       await this.getTransport()?.replyText(msg.messageId, `Pi error: ${message}`);
+    }
+  }
+
+  /**
+   * 通过飞书向指定用户提问，挂起等待回复（数字/文字/0 取消）。
+   * 返回 null 表示超时 / 被取消 / 桥接不可用。
+   */
+  async askQuestion(opts: {
+    key?: string;
+    userId: string;
+    question: string;
+    header?: string;
+    options: QuestionOption[];
+    multiSelect?: boolean;
+    index?: number;
+    total?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<ParsedQuestionAnswer | null> {
+    // 发送问题到飞书（无会话路由则仍等待回复，便于 group 场景降级）
+    if (opts.key) {
+      await this.sendQuestionMessage(opts.key, formatQuestionMessage(opts));
+    }
+
+    // 上一个未完成的问题先取消
+    this.cancelPendingQuestion();
+
+    return new Promise((resolve) => {
+      const timeoutMs = opts.timeoutMs ?? DEFAULT_QUESTION_TIMEOUT_MS;
+      let settled = false;
+      let pending: NonNullable<FeishuMessageHandler["pendingQuestion"]>;
+      let timer: NodeJS.Timeout | undefined;
+
+      const settle = (answer: ParsedQuestionAnswer | null): void => {
+        if (settled) return;
+        settled = true;
+        if (this.pendingQuestion === pending) this.pendingQuestion = null;
+        if (timer) clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", onAbort);
+        resolve(answer);
+      };
+
+      const onAbort = (): void => settle(null);
+
+      timer = setTimeout(() => {
+        if (opts.key) void this.sendQuestionMessage(opts.key, "⏰ 等待回复超时，问题已取消");
+        settle(null);
+      }, timeoutMs);
+
+      pending = {
+        key: opts.key ?? "",
+        userId: opts.userId,
+        options: opts.options,
+        multiSelect: opts.multiSelect ?? false,
+        resolve: settle,
+      };
+      this.pendingQuestion = pending;
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  /**
+   * 尝试把飞书文本消息作为待答问题的答案消费。
+   * 返回 true 表示已消费（消息不再进入队列/模型）。
+   */
+  answerPendingQuestion(userId: string, text: string): boolean {
+    const pending = this.pendingQuestion;
+    if (!pending || pending.userId !== userId) return false;
+
+    const parsed = parseQuestionAnswer(text, pending.options, pending.multiSelect);
+
+    if (parsed.kind === "invalid") {
+      // 数字越界或空文本 → 提示重发，不结束等待
+      const hint = pending.multiSelect
+        ? "⚠️ 请输入有效选项数字（如 1,3），或直接输入自定义文字；回复 0 取消"
+        : "⚠️ 请输入有效选项数字，或直接输入自定义文字；回复 0 取消";
+      if (pending.key) void this.sendQuestionMessage(pending.key, hint);
+      return true;
+    }
+
+    if (parsed.kind === "cancel") {
+      if (pending.key) void this.sendQuestionMessage(pending.key, "✖️ 问题已取消");
+    }
+    pending.resolve(parsed);
+    return true;
+  }
+
+  /** 取消当前待答问题（resolve null，不消费任何消息） */
+  cancelPendingQuestion(): void {
+    const pending = this.pendingQuestion;
+    if (!pending) return;
+    this.pendingQuestion = null;
+    pending.resolve(null);
+  }
+
+  /** 最近活跃会话 key 的最后发送者 open_id（无则 null） */
+  getLastSender(key?: string): string | null {
+    const k = key || this.lastActiveKey;
+    return k ? (this.lastSenderByKey.get(k) ?? null) : null;
+  }
+
+  private async sendQuestionMessage(key: string, text: string): Promise<void> {
+    const route = this.bridgeStore?.getRoute(key);
+    if (!route || !this.delivery) return;
+    try {
+      await this.delivery.send(route, text);
+    } catch (error) {
+      debugLog("feishu.question.send_failed", {
+        key,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
