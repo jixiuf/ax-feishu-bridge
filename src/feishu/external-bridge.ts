@@ -45,6 +45,11 @@ export type ExternalFeishuBridge = {
     text: string,
     opts?: { echo?: boolean },
   ): Promise<ExternalInjectResult>;
+  /**
+   * 直接推送文本到飞书会话（不经 agent 处理，用户立即看到原始消息）。
+   * 用于 subagent 回传 / 协调消息等需要用户直观可见的内容。
+   */
+  notify(key: string, text: string): Promise<{ ok: boolean; error?: string; key?: string }>;
   /** 抢占飞书 gateway（幂等：已持有则直接 ok）。等价 /feishu restart 的抢占语义。 */
   acquire(): Promise<{ ok: boolean; message?: string }>;
   /** 释放飞书 gateway（让位给接管方）。未持有则 no-op。 */

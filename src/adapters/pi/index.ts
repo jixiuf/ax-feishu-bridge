@@ -362,6 +362,27 @@ export default function createPiFeishuExtension(pi: ExtensionAPI, options?: { ex
         }
         return { ok: true, reply: result.reply, key };
       },
+      notify: async (keyOrActive, text) => {
+        const key = !keyOrActive || keyOrActive === "active" ? activeKey() : keyOrActive;
+        if (!key) {
+          return { ok: false, error: "无飞书会话可推送（还没有会话绑定）", key: undefined };
+        }
+        const route = bridgeStore.getRoute(key);
+        if (!route) {
+          return { ok: false, error: `飞书会话不存在: ${key}`, key };
+        }
+        try {
+          await delivery.send(route, text);
+          debugLog("feishu.external.notify_delivered", { key, length: text.length });
+          return { ok: true, key };
+        } catch (error) {
+          debugLog("feishu.external.notify_failed", {
+            key,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return { ok: false, error: error instanceof Error ? error.message : String(error), key };
+        }
+      },
       acquire: async () => {
         if (transport?.isRunning()) {
           return { ok: true, message: "已持有飞书连接" };
