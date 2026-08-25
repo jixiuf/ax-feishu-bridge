@@ -186,11 +186,22 @@ export class PiConversationRuntime implements ConversationRuntime {
   async getContextStatus(key: string): Promise<ContextUsage | null> {
     try {
       const session = await this.getSession(key);
-      const anySession = session as any;
-      const tokens = anySession.contextTokens ?? anySession.tokenCount ?? null;
-      const contextWindow = anySession.contextWindow ?? anySession.model?.contextWindow ?? null;
-      const percent = tokens != null && contextWindow ? (Number(tokens) / Number(contextWindow)) * 100 : null;
-      return { tokens: tokens != null ? Number(tokens) : null, contextWindow: contextWindow != null ? Number(contextWindow) : null, percent };
+      const stats = session.getSessionStats();
+      const ctx = stats.contextUsage;
+      if (!ctx) {
+        // 会话刚创建或模型未就绪时无上下文数据
+        return null;
+      }
+      return {
+        tokens: ctx.tokens,
+        contextWindow: ctx.contextWindow,
+        percent: ctx.percent,
+        totalInput: stats.tokens.input,
+        totalOutput: stats.tokens.output,
+        totalCacheRead: stats.tokens.cacheRead,
+        totalCost: stats.cost,
+        totalMessages: stats.totalMessages,
+      };
     } catch {
       return null;
     }

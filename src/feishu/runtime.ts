@@ -30,6 +30,13 @@ export type ContextUsage = {
   tokens: number | null;
   contextWindow: number | null;
   percent: number | null;
+  /** 会话累计 token 明细（可选，由具体 Runtime 提供；Pi adapter 会填充）。 */
+  totalInput?: number;
+  totalOutput?: number;
+  totalCacheRead?: number;
+  /** 会话累计花费（美元，可选）。 */
+  totalCost?: number;
+  totalMessages?: number;
 };
 
 export type StopConversationResult =

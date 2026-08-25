@@ -231,6 +231,19 @@ export class FeishuMessageHandler {
       const ctxLine = ctx && ctx.tokens !== null && ctx.contextWindow
         ? `${(ctx.percent ?? 0).toFixed(1)}% / ${formatTokens(ctx.contextWindow)} (↑${formatTokens(ctx.tokens ?? 0)} tokens)`
         : "暂无数据（发送一条消息后才会显示）";
+      // Token 明细（仅 Pi adapter 提供；Harness 阶段未接入 token-meter）
+      const tokenLines: string[] = [];
+      if (ctx && ctx.totalInput !== undefined) {
+        tokenLines.push(
+          `Token: in ${formatTokens(ctx.totalInput)} · out ${formatTokens(ctx.totalOutput ?? 0)} · cache ${formatTokens(ctx.totalCacheRead ?? 0)}`,
+        );
+        const detail: string[] = [];
+        if (ctx.totalMessages !== undefined) detail.push(`消息 ${ctx.totalMessages}`);
+        if (ctx.totalCost !== undefined) {
+          detail.push(`花费 $${ctx.totalCost.toFixed(4)}`);
+        }
+        if (detail.length) tokenLines.push(detail.join(" · "));
+      }
       const stateLine = st.hasActiveRun
         ? (st.activeStopped ? "⏹ 已停止" : "🟢 正在生成回复")
         : "⚪ 空闲";
@@ -244,6 +257,7 @@ export class FeishuMessageHandler {
           `模型: ${model}`,
           `thinking: ${thinking.available ? thinking.currentLevel || "(unknown)" : "(unavailable)"}`,
           `上下文: ${ctxLine}`,
+          ...tokenLines,
         ].join("\n"),
       );
       return true;
