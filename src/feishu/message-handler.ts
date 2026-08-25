@@ -520,6 +520,35 @@ export class FeishuMessageHandler {
       return true;
     }
 
+    // /task <描述> — 用户要求以子任务（subagent）方式执行：
+    // 注入 agent 上下文（agent 有 pi-hub 的 task_subagent 工具），由 agent 起子任务并执行；
+    // 子任务进度/结果经 pi-hub 协调消息 notify 推送到飞书，用户全程可见。
+    if (command.name === "task") {
+      const text = (command.text || "").trim();
+      if (!text) {
+        await transport.replyText(msg.messageId, "用法: /task <任务描述>\n例: /task 查用户 545473 的 passgo 信息");
+        return true;
+      }
+      await transport.replyText(
+        msg.messageId,
+        "🚀 收到，将以子任务方式执行。任务进度和结果会推送到这里，请稍候…",
+      );
+      await this.conversations.prompt(
+        key,
+        [
+          "【用户要求以子任务(subagent)方式执行】",
+          text,
+          "",
+          "请调用 task_subagent 工具执行（host 选择：线上查库/日志用 bj-vc-client-apm-01，代码/仓库分析用 ljmacjxf），",
+          "任务描述中明确输出格式（JSON/表格），执行完成后向用户汇总结果。",
+        ].join("\n"),
+        async (reply) => {
+          await transport.replyText(msg.messageId, reply || "子任务已发起。");
+        },
+      );
+      return true;
+    }
+
     return false;
   }
 

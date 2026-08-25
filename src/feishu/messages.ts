@@ -13,7 +13,8 @@ export type BotCommand =
   | { name: "config"; key?: string; value?: string; clearTarget?: string }
   | { name: "feishu"; action?: "start" | "stop" | "restart" | "status" }
   | { name: "reload" }
-  | { name: "reloadall" };
+  | { name: "reloadall" }
+  | { name: "task"; text: string };
 
 type PostBody = {
   title?: string;
@@ -141,6 +142,11 @@ export function parseBotCommand(text: string): BotCommand | undefined {
   // /reload /reloadall — 重载本实例扩展 / 广播重载所有实例（经 pi-hub 机制执行）
   if (trimmed === "/reload") return { name: "reload" };
   if (trimmed === "/reloadall") return { name: "reloadall" };
+  // /task <描述> — 用户要求以子任务（subagent）方式执行
+  const taskMatch = trimmed.match(/^\/task\s+(.+)$/s);
+  if (taskMatch) {
+    return { name: "task", text: taskMatch[1].trim() };
+  }
   return undefined;
 }
 
@@ -159,6 +165,7 @@ export function getCommandList(): string {
     "/feishu [start|stop|restart|status] — 管理飞书网关（默认 status）",
     "/reload — 重载当前实例扩展",
     "/reloadall — 广播重载所有实例",
+    "/task <描述> — 以子任务(subagent)方式执行，进度/结果推送到飞书",
     "/commands — 显示命令列表",
   ].join("\n");
 }
