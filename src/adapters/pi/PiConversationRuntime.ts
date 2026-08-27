@@ -46,6 +46,7 @@ const RESUME_PAGE_SIZE = 10;
 
 export class PiConversationRuntime implements ConversationRuntime {
   private readonly sessions = new Map<string, Promise<AgentSession>>();
+  private readonly sessionFileStats = new Map<string, { mtimeMs: number; size: number }>();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly activeRuns = new Map<string, ActiveRun>();
   private modelRuntimePromise: Promise<ModelRuntimeAdapter> | undefined;
@@ -100,7 +101,7 @@ export class PiConversationRuntime implements ConversationRuntime {
     const previous = this.previousTurn(key);
     const next = previous.then(async () => {
       debugLog("feishu.prompt.start", { key, textLength: userText.length, imageCount: images.length });
-      const session = await this.getSession(key);
+      const session = await this.ensureSessionFresh(key);
       const run: ActiveRun = { session, runId: status?.runId, stopped: false, status, onDelta };
       this.activeRuns.set(key, run);
       this.bridge?.beginFeishuInput(session.sessionId);
@@ -131,6 +132,7 @@ export class PiConversationRuntime implements ConversationRuntime {
         run.onDelta = undefined;
         if (this.activeRuns.get(key) === run) this.activeRuns.delete(key);
         this.bridge?.endFeishuInput(session.sessionId);
+        this.recordSessionFileStat(key, session.sessionFile);
       }
       if (run.stopped) return;
       const answer = extractLastAssistantText(session);
@@ -234,6 +236,7 @@ export class PiConversationRuntime implements ConversationRuntime {
         try { (await cached).dispose(); } catch {}
       }
       this.sessions.delete(key);
+      this.sessionFileStats.delete(key);
       delete this.state.sessions[key];
       writeJson(STATE_PATH, this.state);
       await onReply("已创建新会话。旧会话历史已保留，下一条消息会从新上下文开始。");
@@ -296,6 +299,7 @@ export class PiConversationRuntime implements ConversationRuntime {
       if (currentPath === sessionPath) {
         this.state.workspaces![key] = sessionInfo.cwd || this.getWorkspace(key);
         writeJson(STATE_PATH, this.state);
+        this.recordSessionFileStat(key, sessionPath);
         await onReply(`你已经在这个历史会话里了。\n当前工作区：${this.state.workspaces![key]}`);
         return;
       }
@@ -306,9 +310,11 @@ export class PiConversationRuntime implements ConversationRuntime {
       }
 
       this.sessions.delete(key);
+      this.sessionFileStats.delete(key);
       this.state.sessions[key] = sessionPath;
       this.state.workspaces![key] = sessionInfo.cwd || this.cwd;
       writeJson(STATE_PATH, this.state);
+      this.recordSessionFileStat(key, sessionPath);
       await onReply([
         `已切换到历史会话：${sessionInfo.name?.trim() || summarizeFirstMessage(sessionInfo.firstMessage)}`,
         `工作区：${this.state.workspaces![key]}`,
@@ -331,7 +337,8 @@ export class PiConversationRuntime implements ConversationRuntime {
         return;
       }
 
-      this.state.models![key] = { provider, id: modelId };
+      const existing = this.state.models?.[key];
+      this.state.models![key] = { provider, id: modelId, thinkingLevel: existing?.thinkingLevel };
       writeJson(STATE_PATH, this.state);
 
       const cached = this.sessions.get(key);
@@ -339,6 +346,7 @@ export class PiConversationRuntime implements ConversationRuntime {
         try { (await cached).dispose(); } catch {}
       }
       this.sessions.delete(key);
+      this.sessionFileStats.delete(key);
       await onReply(`已切换到 ${provider}/${modelId}。当前飞书会话后续都会使用这个模型。`);
     }).catch(async (error) => {
       await onReply(`Pi error: ${error instanceof Error ? error.message : String(error)}`);
@@ -371,6 +379,11 @@ export class PiConversationRuntime implements ConversationRuntime {
         return;
       }
       sessionApi.setThinkingLevel(level);
+      const existing = this.state.models?.[key];
+      if (existing) {
+        this.state.models![key] = { ...existing, thinkingLevel: level };
+        writeJson(STATE_PATH, this.state);
+      }
       const effective = this.getThinkingStatusForSession(session).currentLevel || level;
       await onReply(`Thinking level set to: ${effective}`);
     }).catch(async (error) => {
@@ -403,6 +416,7 @@ export class PiConversationRuntime implements ConversationRuntime {
         try { (await cached).dispose(); } catch {}
       }
       this.sessions.delete(key);
+      this.sessionFileStats.delete(key);
       delete this.state.sessions[key];
       this.state.workspaces![key] = workspace;
       writeJson(STATE_PATH, this.state);
@@ -465,8 +479,68 @@ export class PiConversationRuntime implements ConversationRuntime {
       void session.then((s) => s.dispose()).catch(() => undefined);
     }
     this.sessions.clear();
+    this.sessionFileStats.clear();
     this.queues.clear();
     this.state = { sessions: {}, models: {}, workspaces: {} };
+  }
+
+  private recordSessionFileStat(key: string, sessionFile?: string) {
+    const filePath = sessionFile || this.state.sessions[key];
+    if (!filePath) {
+      this.sessionFileStats.delete(key);
+      return;
+    }
+    try {
+      if (existsSync(filePath)) {
+        const stat = statSync(filePath);
+        this.sessionFileStats.set(key, {
+          mtimeMs: stat.mtimeMs,
+          size: stat.size,
+        });
+      }
+    } catch {}
+  }
+
+  private async ensureSessionFresh(key: string): Promise<AgentSession> {
+    const cachedPromise = this.sessions.get(key);
+    if (!cachedPromise) {
+      return this.getSession(key);
+    }
+    const sessionFile = this.state.sessions[key];
+    const recorded = this.sessionFileStats.get(key);
+    if (sessionFile && existsSync(sessionFile)) {
+      try {
+        const currentStat = statSync(sessionFile);
+        const isModified = recorded
+          ? currentStat.mtimeMs > recorded.mtimeMs || currentStat.size !== recorded.size
+          : false;
+        if (isModified) {
+          debugLog("feishu.pi.session_hot_reload", {
+            key,
+            sessionFile,
+            recordedMtime: recorded?.mtimeMs,
+            currentMtime: currentStat.mtimeMs,
+            recordedSize: recorded?.size,
+            currentSize: currentStat.size,
+          });
+          try {
+            const oldSession = await cachedPromise;
+            oldSession.dispose();
+          } catch {}
+          this.sessions.delete(key);
+          const refreshed = this.createSession(key);
+          this.sessions.set(key, refreshed);
+          return refreshed;
+        }
+        if (!recorded) {
+          this.sessionFileStats.set(key, {
+            mtimeMs: currentStat.mtimeMs,
+            size: currentStat.size,
+          });
+        }
+      } catch {}
+    }
+    return cachedPromise;
   }
 
   private getSession(key: string): Promise<AgentSession> {
@@ -602,10 +676,18 @@ export class PiConversationRuntime implements ConversationRuntime {
       }
     });
 
+    const desiredThinkingLevel = this.state.models?.[key]?.thinkingLevel;
+    if (desiredThinkingLevel && typeof (session as any).setThinkingLevel === "function") {
+      try {
+        (session as any).setThinkingLevel(desiredThinkingLevel);
+      } catch {}
+    }
+
     if (session.sessionFile && this.state.sessions[key] !== session.sessionFile) {
       this.state.sessions[key] = session.sessionFile;
       writeJson(STATE_PATH, this.state);
     }
+    this.recordSessionFileStat(key, session.sessionFile);
     return session;
   }
 
